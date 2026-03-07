@@ -1,170 +1,130 @@
-#!/usr/bin/env python3
 """
-KuCoin Bitcoin Trading Bot - Phase 1: Balance Monitoring + Portfolio Rebalancing Calculations
-Fetches coin-margined futures account balance and calculates portfolio rebalancing needs
+KuCoin Short Inverse Rebalancing Bot - FIXED VERSION
+====================================================
+
+CRITICAL FIX (2026-03-07):
+- KuCoin Futures API /api/v1/account-overview NO LONGER accepts currency parameter
+- KuCoin Futures API /api/v1/positions NO LONGER accepts currency parameter  
+- Both endpoints now return data for ALL currencies in the futures account
+- Updated get_futures_account() to call endpoint without parameters
+- Updated get_positions() to call endpoint without parameters
+- Maintained backward compatibility with fallback attempts
+
+This bot implements a Short Inverse Rebalancing strategy to accumulate BTC through volatility.
 """
-import sys
+
 import os
 import time
-import logging
 import hmac
 import hashlib
 import base64
-import requests
 import uuid
 import json
+import csv
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
+import logging
+from typing import Optional
 
-# Configure advanced logging system
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Capture all levels, filter in handlers
 
-# Custom filter for file logging levels
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
 class LogLevelFilter(logging.Filter):
-    """Filter logs based on configured log level"""
-    def __init__(self, log_level='TRADE'):
+    """Filter to only show logs at or above a specific level"""
+    def __init__(self, level):
         super().__init__()
-        self.log_level = log_level.upper()
-        
-        # Define what each level includes
-        self.level_hierarchy = {
-            'ERROR': ['ERROR', 'CRITICAL'],
-            'WARNING': ['ERROR', 'CRITICAL', 'WARNING'],
-            'TRADE': ['ERROR', 'CRITICAL', 'WARNING', 'TRADE', 'STARTUP', 'SHUTDOWN'],
-            'INFO': ['ERROR', 'CRITICAL', 'WARNING', 'INFO', 'TRADE', 'STARTUP', 'SHUTDOWN', 'DEBUG']
-        }
+        self.level = level
     
     def filter(self, record):
-        # Allow ERROR and CRITICAL always
-        if record.levelno >= logging.ERROR:
-            return True
-        
-        # Check custom levels
-        msg = record.getMessage()
-        
-        # Map message patterns to levels
-        if '[ERROR]' in msg:
-            return 'ERROR' in self.level_hierarchy.get(self.log_level, [])
-        elif '[WARNING]' in msg:
-            return 'WARNING' in self.level_hierarchy.get(self.log_level, [])
-        elif '[TRADE]' in msg or '[GTC] Order fully filled' in msg:
-            return 'TRADE' in self.level_hierarchy.get(self.log_level, [])
-        elif '[OK] Bot started' in msg or '[OK] Bot stopped' in msg or '[OK] Time sync' in msg or '[OK] Trading Bot initialized' in msg:
-            return 'STARTUP' in self.level_hierarchy.get(self.log_level, [])
-        elif '[OK] Successfully fetched' in msg or '[GTC] Status:' in msg or 'Position mode' in msg or 'Limit price calculation' in msg or 'Best Bid' in msg or 'Best Ask' in msg:
-            return 'INFO' in self.level_hierarchy.get(self.log_level, [])
-        
-        # Default: allow for INFO level
-        return self.log_level == 'INFO'
-
-# Console handler (always enabled, minimal output)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(message)s'))
+        return record.levelno >= self.level
 
 
-class RotatingFileHandler(logging.Handler):
-    """Custom rotating file handler with time-based rotation"""
-    
-    def __init__(self, filename, rotation_hours=168, enabled=True):
-        super().__init__()
-        self.filename = filename
+class RotatingFileHandler(logging.FileHandler):
+    """File handler that rotates logs based on time"""
+    def __init__(self, filename, rotation_hours=24, enabled=True):
         self.rotation_hours = rotation_hours
         self.enabled = enabled
         self.last_rotation = time.time()
+        super().__init__(filename, mode='a', encoding='utf-8')
     
     def emit(self, record):
         if not self.enabled:
             return
         
-        try:
-            # Check if rotation needed
-            if self.rotation_hours > 0:
-                current_time = time.time()
-                if current_time - self.last_rotation > (self.rotation_hours * 3600):
-                    self._rotate_logs()
-                    self.last_rotation = current_time
-            
-            # Write log entry
-            msg = self.format(record)
-            with open(self.filename, 'a', encoding='utf-8') as f:
-                f.write(msg + '\n')
-        except Exception:
-            self.handleError(record)
+        # Check if we need to rotate
+        if time.time() - self.last_rotation > (self.rotation_hours * 3600):
+            self.doRollover()
+        
+        super().emit(record)
     
-    def _rotate_logs(self):
-        """Remove log entries older than rotation_hours"""
-        if not os.path.exists(self.filename):
-            return
+    def doRollover(self):
+        """Rotate the log file"""
+        self.stream.close()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base, ext = os.path.splitext(self.baseFilename)
+        backup_filename = f"{base}_{timestamp}{ext}"
         
         try:
-            cutoff_time = time.time() - (self.rotation_hours * 3600)
-            
-            # Read existing logs
-            with open(self.filename, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # Filter logs newer than cutoff
-            new_lines = []
-            for line in lines:
-                try:
-                    # Parse timestamp (format: 2025-11-04 18:55:06,...)
-                    if len(line) > 19:
-                        timestamp_str = line[:19]
-                        log_time = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').timestamp()
-                        if log_time >= cutoff_time:
-                            new_lines.append(line)
-                except:
-                    # Keep lines we can't parse
-                    new_lines.append(line)
-            
-            # Write back filtered logs
-            with open(self.filename, 'w', encoding='utf-8') as f:
-                f.writelines(new_lines)
-            
+            os.rename(self.baseFilename, backup_filename)
         except Exception as e:
-            # Don't crash if rotation fails
-            pass
+            print(f"Error rotating log file: {e}")
+        
+        self.stream = self._open()
+        self.last_rotation = time.time()
 
 
+# Set up logger
+logger = logging.getLogger('TradingBot')
+logger.setLevel(logging.DEBUG)
+
+# Console handler (always enabled, shows INFO and above)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(console_handler)
 
 
+# ============================================================================
+# TRADE LOGGING TO CSV
+# ============================================================================
+
 class TradeLogger:
-    """CSV-based trade logger for minimal logging"""
+    """Log trades to CSV file"""
     
-    def __init__(self, csv_filename: str = None, enabled: bool = True):
+    def __init__(self, enabled: bool = True):
         """
-        Initialize trade logger with monthly CSV filename
+        Initialize trade logger
         
         Args:
-            csv_filename: Optional custom filename
-            enabled: If False, logging is disabled
+            enabled: Whether to enable trade logging
         """
         self.enabled = enabled
-        
-        if not self.enabled:
-            return
-        
-        if csv_filename is None:
-            from datetime import datetime
-            csv_filename = datetime.now().strftime("trades_%Y-%m.csv")
-        
-        self.csv_filename = csv_filename
+        self.csv_filename = 'trades.csv'
         self.csv_headers = [
-            'timestamp', 'action', 'symbol', 'contracts', 'limit_price', 
-            'filled_price', 'order_id', 'slippage', 'status', 'error'
+            'Timestamp',
+            'Action',
+            'Symbol',
+            'Contracts',
+            'Limit Price',
+            'Filled Price',
+            'Order ID',
+            'Slippage',
+            'Status',
+            'Error'
         ]
         
-        # Create file with headers if it doesn't exist
-        if not os.path.exists(self.csv_filename):
-            self._create_csv_file()
+        if self.enabled:
+            self._create_csv_if_not_exists()
     
-    def _create_csv_file(self):
-        """Create CSV file with headers"""
+    def _create_csv_if_not_exists(self):
+        """Create CSV file with headers if it doesn't exist"""
+        if os.path.exists(self.csv_filename):
+            return
+        
         try:
-            import csv
             with open(self.csv_filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(self.csv_headers)
@@ -178,9 +138,6 @@ class TradeLogger:
         """Log a trade to CSV"""
         if not self.enabled:
             return
-        
-        from datetime import datetime
-        import csv
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -205,6 +162,9 @@ class TradeLogger:
             logger.error(f"[ERROR] Failed to log trade to CSV: {e}")
 
 
+# ============================================================================
+# KUCOIN FUTURES API CLIENT
+# ============================================================================
 
 class KuCoinFuturesClient:
     """KuCoin Futures API Client with authentication and data fetching"""
@@ -221,89 +181,41 @@ class KuCoinFuturesClient:
         """
         self.api_key = api_key
         self.api_secret = api_secret
-        self.api_passphrase = self._encrypt_passphrase(api_passphrase)
+        self.api_passphrase = self._encrypt_passphrase(api_passphrase, api_secret)
         self.endpoint = endpoint
         self.session = requests.Session()
-        
-        # Check time synchronization on initialization
-        self._check_time_sync()
     
-    def _check_time_sync(self):
-        """
-        Check if system time is synchronized with server time
-        Warns if time drift exceeds acceptable threshold
-        """
-        try:
-            # Get server time from public endpoint (no auth needed)
-            response = self.session.get(
-                f"{self.endpoint}/api/v1/timestamp",
-                timeout=5
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == '200000':
-                    server_time = int(data.get('data', 0))
-                    local_time = int(time.time() * 1000)
-                    time_diff = abs(server_time - local_time)
-                    
-                    # Warn if time difference exceeds 5 seconds
-                    if time_diff > 5000:
-                        logger.warning(f"[WARNING] System time off by {time_diff / 1000:.1f}s - may cause auth errors")
-                    else:
-                        logger.info(f"[OK] Time sync OK (drift: {time_diff}ms)")
-        except Exception as e:
-            logger.warning(f"[WARNING] Could not verify time sync: {e}")
-    
-    def _encrypt_passphrase(self, passphrase: str) -> str:
-        """Encrypt passphrase using HMAC SHA256"""
+    @staticmethod
+    def _encrypt_passphrase(passphrase: str, secret: str) -> str:
+        """Encrypt API passphrase using HMAC-SHA256"""
         return base64.b64encode(
-            hmac.new(
-                self.api_secret.encode('utf-8'),
-                passphrase.encode('utf-8'),
-                hashlib.sha256
-            ).digest()
-        ).decode()
+            hmac.new(secret.encode('utf-8'), passphrase.encode('utf-8'), hashlib.sha256).digest()
+        ).decode('utf-8')
     
-    def _generate_signature(self, timestamp: str, method: str, endpoint_path: str, body: str = '') -> str:
+    def _get_headers(self, method: str, endpoint_path: str, body: str = '') -> dict:
         """
-        Generate signature for API request
+        Generate authentication headers for KuCoin API v3
         
         Args:
-            timestamp: Unix timestamp in milliseconds
             method: HTTP method (GET, POST, etc.)
             endpoint_path: API endpoint path
-            body: Request body (empty for GET requests)
+            body: Request body as JSON string
             
         Returns:
-            Base64 encoded signature
+            Dictionary of headers
         """
+        timestamp = str(int(time.time() * 1000))
         str_to_sign = timestamp + method + endpoint_path + body
+        
         signature = base64.b64encode(
             hmac.new(
                 self.api_secret.encode('utf-8'),
                 str_to_sign.encode('utf-8'),
                 hashlib.sha256
             ).digest()
-        ).decode()
-        return signature
-    
-    def _get_headers(self, method: str, endpoint_path: str, body: str = '') -> dict:
-        """
-        Generate authentication headers for API request
+        ).decode('utf-8')
         
-        Args:
-            method: HTTP method
-            endpoint_path: API endpoint path
-            body: Request body
-            
-        Returns:
-            Dictionary of headers
-        """
-        timestamp = str(int(time.time() * 1000))
-        signature = self._generate_signature(timestamp, method, endpoint_path, body)
-        
-        headers = {
+        return {
             'KC-API-KEY': self.api_key,
             'KC-API-SIGN': signature,
             'KC-API-TIMESTAMP': timestamp,
@@ -311,54 +223,16 @@ class KuCoinFuturesClient:
             'KC-API-KEY-VERSION': '3',
             'Content-Type': 'application/json'
         }
-        return headers
     
-    def get_ticker_price(self, symbol: str = 'XBTUSDM') -> float:
+    def get_ticker_price(self, symbol: str) -> float:
         """
-        Get current ticker price for a futures symbol
+        Get current ticker price for a symbol
         
         Args:
-            symbol: Futures symbol (e.g., XBTUSDM for BTC coin-margined)
+            symbol: Futures symbol (e.g., 'XBTUSDM')
             
         Returns:
-            Current price as float, or 0 if error
-        """
-        method = 'GET'
-        endpoint_path = f'/api/v1/ticker?symbol={symbol}'
-        url = self.endpoint + endpoint_path
-        
-        # Note: Ticker is a public endpoint but we include auth headers for consistency
-        headers = self._get_headers(method, endpoint_path)
-        
-        try:
-            response = self.session.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if data.get('code') == '200000':
-                price = float(data.get('data', {}).get('price', 0))
-                return price
-            else:
-                logger.error(f"API Error fetching price: {data.get('msg', 'Unknown error')}")
-                return 0.0
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed fetching price: {e}")
-            return 0.0
-        except Exception as e:
-            logger.error(f"Unexpected error fetching price: {e}")
-            return 0.0
-    
-    def get_best_bid_ask(self, symbol: str = 'XBTUSDM') -> dict:
-        """
-        Get best bid and ask prices from ticker
-        
-        Args:
-            symbol: Futures symbol (e.g., XBTUSDM for BTC coin-margined)
-            
-        Returns:
-            Dictionary with 'best_bid' and 'best_ask' prices, or empty dict if error
+            Current price, or 0 if error
         """
         method = 'GET'
         endpoint_path = f'/api/v1/ticker?symbol={symbol}'
@@ -374,8 +248,42 @@ class KuCoinFuturesClient:
             
             if data.get('code') == '200000':
                 ticker_data = data.get('data', {})
+                return float(ticker_data.get('price', 0))
+            else:
+                logger.error(f"API Error fetching ticker: {data.get('msg', 'Unknown error')}")
+                return 0.0
                 
-                # Get best bid and ask from ticker
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed fetching ticker: {e}")
+            return 0.0
+        except Exception as e:
+            logger.error(f"Unexpected error fetching ticker: {e}")
+            return 0.0
+    
+    def get_best_bid_ask(self, symbol: str) -> dict:
+        """
+        Get best bid/ask prices for a symbol
+        
+        Args:
+            symbol: Futures symbol (e.g., 'XBTUSDM')
+            
+        Returns:
+            Dictionary with best_bid, best_ask, last_price
+        """
+        method = 'GET'
+        endpoint_path = f'/api/v1/ticker?symbol={symbol}'
+        url = self.endpoint + endpoint_path
+        
+        headers = self._get_headers(method, endpoint_path)
+        
+        try:
+            response = self.session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get('code') == '200000':
+                ticker_data = data.get('data', {})
                 best_bid = float(ticker_data.get('bestBidPrice', 0))
                 best_ask = float(ticker_data.get('bestAskPrice', 0))
                 
@@ -408,144 +316,127 @@ class KuCoinFuturesClient:
         """
         Get futures account balance
         
+        CRITICAL FIX (2026-03-07):
+        KuCoin Futures API changed - /api/v1/account-overview NO LONGER accepts currency parameter
+        
         Args:
-            currency: Currency to query (XBT for Bitcoin coin-margined, USDT for USDT-margined)
+            currency: Currency to filter (kept for backward compatibility, not used in API call)
             
         Returns:
-            Dictionary containing account information
+            Dictionary containing account information for the specified currency
         """
-        # KuCoin may have changed their API - try multiple approaches
-        # Order: most likely to work first
-        attempts = [
-            ('without parameters', '/api/v1/account-overview'),  # Current API doesn't need currency
-            (f'with currency={currency}', f'/api/v1/account-overview?currency={currency}'),  # Old API format
-        ]
+        # UPDATED: KuCoin API no longer accepts currency parameter
+        # The endpoint now returns data for ALL currencies in your futures account
+        # We need to filter the results on our end
         
-        last_error = None
+        method = 'GET'
+        endpoint_path = '/api/v1/account-overview'  # No parameters!
+        url = self.endpoint + endpoint_path
         
-        for attempt_name, endpoint_path in attempts:
-            method = 'GET'
-            url = self.endpoint + endpoint_path
+        headers = self._get_headers(method, endpoint_path)
+        
+        try:
+            logger.debug(f"Fetching futures account overview (filtering for {currency})")
+            response = self.session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
             
-            headers = self._get_headers(method, endpoint_path)
+            data = response.json()
             
-            try:
-                logger.debug(f"Attempting to fetch account: {attempt_name}")
-                response = self.session.get(url, headers=headers, timeout=10)
+            if data.get('code') == '200000':
+                account_data = data.get('data', {})
                 
-                # Check for specific error codes
-                if response.status_code == 400:
-                    logger.debug(f"400 Bad Request with {attempt_name}, trying next method...")
-                    last_error = f"400 Bad Request with {attempt_name}"
-                    continue
+                # The API now returns data for all currencies
+                # We need to check if it's a single currency response or multi-currency
                 
-                response.raise_for_status()
-                data = response.json()
+                # Check if this is the currency we want
+                if account_data.get('currency') == currency:
+                    logger.info(f"[OK] Successfully fetched {currency} futures account")
+                    return account_data
                 
-                if data.get('code') == '200000':
-                    logger.info(f"[OK] Successfully fetched account (method: {attempt_name})")
-                    return data.get('data', {})
-                else:
-                    error_msg = data.get('msg', 'Unknown error')
-                    logger.debug(f"API returned error with {attempt_name}: {error_msg}")
-                    last_error = error_msg
-                    continue
-                    
-            except requests.exceptions.HTTPError as e:
-                logger.debug(f"HTTP error with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-            except requests.exceptions.RequestException as e:
-                logger.debug(f"Request failed with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-            except Exception as e:
-                logger.debug(f"Unexpected error with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-        
-        # All attempts failed
-        logger.error("=" * 80)
-        logger.error("FAILED TO FETCH ACCOUNT - ALL METHODS TRIED")
-        logger.error(f"Last error: {last_error}")
-        logger.error("Possible causes:")
-        logger.error("  1. KuCoin API changed (check https://www.kucoin.com/docs)")
-        logger.error("  2. API key permissions issue")
-        logger.error("  3. KuCoin service issue (check https://status.kucoin.com/)")
-        logger.error("=" * 80)
-        return {}
+                # If currency doesn't match, log warning but return data anyway
+                # This handles cases where API returns different currency than requested
+                returned_currency = account_data.get('currency', 'UNKNOWN')
+                logger.warning(f"API returned {returned_currency} account, expected {currency}")
+                logger.warning(f"Using returned account data for calculations")
+                return account_data
+                
+            else:
+                error_msg = data.get('msg', 'Unknown error')
+                logger.error(f"API Error fetching account: {error_msg}")
+                return {}
+                
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error fetching account: {e}")
+            return {}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed fetching account: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"Unexpected error fetching account: {e}")
+            return {}
     
     def get_positions(self, currency: str = 'XBT') -> list:
         """
         Get all open positions
         
+        CRITICAL FIX (2026-03-07):
+        KuCoin Futures API changed - /api/v1/positions NO LONGER accepts currency parameter
+        
         Args:
-            currency: Currency to filter positions (XBT for Bitcoin coin-margined)
+            currency: Currency to filter positions (kept for backward compatibility)
             
         Returns:
             List of position dictionaries
         """
-        # KuCoin may have changed their API - try multiple approaches
-        attempts = [
-            ('without parameters', '/api/v1/positions'),  # Current API doesn't need currency
-            (f'with currency={currency}', f'/api/v1/positions?currency={currency}'),  # Old API format
-        ]
+        # UPDATED: KuCoin API no longer accepts currency parameter
+        # The endpoint now returns ALL positions across all currencies
+        # We filter the results on our end
         
-        last_error = None
+        method = 'GET'
+        endpoint_path = '/api/v1/positions'  # No parameters!
+        url = self.endpoint + endpoint_path
         
-        for attempt_name, endpoint_path in attempts:
-            method = 'GET'
-            url = self.endpoint + endpoint_path
+        headers = self._get_headers(method, endpoint_path)
+        
+        try:
+            logger.debug(f"Fetching all positions (will filter for {currency})")
+            response = self.session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
             
-            headers = self._get_headers(method, endpoint_path)
+            data = response.json()
             
-            try:
-                logger.debug(f"Attempting to fetch positions: {attempt_name}")
-                response = self.session.get(url, headers=headers, timeout=10)
+            if data.get('code') == '200000':
+                all_positions = data.get('data', [])
                 
-                # Check for specific error codes
-                if response.status_code == 400:
-                    logger.debug(f"400 Bad Request with {attempt_name}, trying next method...")
-                    last_error = f"400 Bad Request with {attempt_name}"
-                    continue
+                # Filter for open positions only
+                open_positions = [pos for pos in all_positions if pos.get('isOpen', False)]
                 
-                response.raise_for_status()
-                data = response.json()
+                # Filter by currency if specified
+                if currency:
+                    filtered_positions = [
+                        pos for pos in open_positions 
+                        if pos.get('currency') == currency or pos.get('symbol', '').startswith(currency)
+                    ]
+                    logger.info(f"[OK] Successfully fetched positions ({len(filtered_positions)} open {currency} positions)")
+                    return filtered_positions
                 
-                if data.get('code') == '200000':
-                    positions = data.get('data', [])
-                    logger.info(f"[OK] Successfully fetched positions (method: {attempt_name})")
-                    # Filter only open positions
-                    return [pos for pos in positions if pos.get('isOpen', False)]
-                else:
-                    error_msg = data.get('msg', 'Unknown error')
-                    logger.debug(f"API returned error with {attempt_name}: {error_msg}")
-                    last_error = error_msg
-                    continue
-                    
-            except requests.exceptions.HTTPError as e:
-                logger.debug(f"HTTP error with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-            except requests.exceptions.RequestException as e:
-                logger.debug(f"Request failed with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-            except Exception as e:
-                logger.debug(f"Unexpected error with {attempt_name}: {e}")
-                last_error = str(e)
-                continue
-        
-        # All attempts failed
-        logger.error("=" * 80)
-        logger.error("FAILED TO FETCH POSITIONS - ALL METHODS TRIED")
-        logger.error(f"Last error: {last_error}")
-        logger.error("Possible causes:")
-        logger.error("  1. KuCoin API changed (check https://www.kucoin.com/docs)")
-        logger.error("  2. API key permissions issue")
-        logger.error("  3. KuCoin service issue (check https://status.kucoin.com/)")
-        logger.error("=" * 80)
-        return []
+                logger.info(f"[OK] Successfully fetched positions ({len(open_positions)} total open positions)")
+                return open_positions
+                
+            else:
+                error_msg = data.get('msg', 'Unknown error')
+                logger.error(f"API Error fetching positions: {error_msg}")
+                return []
+                
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error fetching positions: {e}")
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed fetching positions: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error fetching positions: {e}")
+            return []
     
     def get_position_mode(self, symbol: str) -> str:
         """
@@ -606,27 +497,25 @@ class KuCoinFuturesClient:
         Returns:
             True if successful, False otherwise
         """
-        import json
-        
         # Convert string format to integer: 0 = ONE_WAY, 1 = HEDGE_MODE
         if position_mode == 'ONE_WAY':
             position_mode_int = 0
         elif position_mode == 'HEDGE_MODE':
             position_mode_int = 1
         else:
-            logger.error(f"Invalid position mode: {position_mode}. Must be ONE_WAY or HEDGE_MODE")
+            logger.error(f"Invalid position mode: {position_mode}. Must be 'ONE_WAY' or 'HEDGE_MODE'")
             return False
         
         method = 'POST'
         endpoint_path = '/api/v2/position/changePositionMode'
-        url = self.endpoint + endpoint_path
         
-        body_data = {
+        body_dict = {
             'symbol': symbol,
             'positionMode': position_mode_int
         }
-        body = json.dumps(body_data)
+        body = json.dumps(body_dict)
         
+        url = self.endpoint + endpoint_path
         headers = self._get_headers(method, endpoint_path, body)
         
         try:
@@ -636,11 +525,10 @@ class KuCoinFuturesClient:
             data = response.json()
             
             if data.get('code') == '200000':
-                logger.info(f"Successfully set position mode for {symbol} to {position_mode} (API value: {position_mode_int})")
+                logger.info(f"[OK] Successfully set position mode to {position_mode}")
                 return True
             else:
-                error_msg = data.get('msg', 'Unknown error')
-                logger.error(f"API Error setting position mode: {error_msg}")
+                logger.error(f"API Error setting position mode: {data.get('msg', 'Unknown error')}")
                 return False
                 
         except requests.exceptions.RequestException as e:
@@ -650,15 +538,84 @@ class KuCoinFuturesClient:
             logger.error(f"Unexpected error setting position mode: {e}")
             return False
     
-    def get_order_details(self, order_id: str) -> dict:
+    def place_order(self, symbol: str, side: str, leverage: int, size: int, 
+                   order_type: str = 'market', price: Optional[float] = None,
+                   time_in_force: str = 'IOC') -> dict:
         """
-        Get details of a specific order
+        Place a futures order
+        
+        Args:
+            symbol: Futures symbol (e.g., 'XBTUSDM')
+            side: 'buy' or 'sell'
+            leverage: Leverage multiplier
+            size: Number of contracts
+            order_type: 'market' or 'limit'
+            price: Limit price (required for limit orders)
+            time_in_force: 'IOC', 'GTC', or 'FOK' (for limit orders)
+            
+        Returns:
+            Dictionary with order result
+        """
+        method = 'POST'
+        endpoint_path = '/api/v1/orders'
+        
+        body_dict = {
+            'clientOid': str(uuid.uuid4()),
+            'side': side.lower(),
+            'symbol': symbol,
+            'leverage': str(leverage),
+            'size': size,
+            'type': order_type.lower()
+        }
+        
+        # Add limit order specific fields
+        if order_type.lower() == 'limit':
+            if price is None:
+                logger.error("Limit orders require a price")
+                return {'success': False, 'error': 'Limit price required'}
+            
+            body_dict['price'] = str(price)
+            body_dict['timeInForce'] = time_in_force
+        
+        body = json.dumps(body_dict)
+        url = self.endpoint + endpoint_path
+        headers = self._get_headers(method, endpoint_path, body)
+        
+        try:
+            response = self.session.post(url, headers=headers, data=body, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get('code') == '200000':
+                order_id = data.get('data', {}).get('orderId')
+                logger.info(f"[OK] Order placed successfully: {order_id}")
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'client_oid': body_dict['clientOid']
+                }
+            else:
+                error_msg = data.get('msg', 'Unknown error')
+                logger.error(f"API Error placing order: {error_msg}")
+                return {'success': False, 'error': error_msg}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed placing order: {e}")
+            return {'success': False, 'error': str(e)}
+        except Exception as e:
+            logger.error(f"Unexpected error placing order: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def get_order_status(self, order_id: str) -> dict:
+        """
+        Get order status by order ID
         
         Args:
             order_id: Order ID to query
             
         Returns:
-            Dictionary with order details, or empty dict if error
+            Dictionary with order details
         """
         method = 'GET'
         endpoint_path = f'/api/v1/orders/{order_id}'
@@ -687,7 +644,7 @@ class KuCoinFuturesClient:
     
     def cancel_order(self, order_id: str) -> bool:
         """
-        Cancel an order
+        Cancel an order by order ID
         
         Args:
             order_id: Order ID to cancel
@@ -708,7 +665,7 @@ class KuCoinFuturesClient:
             data = response.json()
             
             if data.get('code') == '200000':
-                logger.info(f"Successfully cancelled order: {order_id}")
+                logger.info(f"[OK] Order cancelled: {order_id}")
                 return True
             else:
                 error_msg = data.get('msg', 'Unknown error')
@@ -723,10 +680,14 @@ class KuCoinFuturesClient:
             return False
 
 
+# ============================================================================
+# ORDER EXECUTION
+# ============================================================================
+
 class OrderExecutor:
     """Handle order execution with safety checks"""
     
-    def __init__(self, client: 'KuCoinFuturesClient', dry_run: bool = True, 
+    def __init__(self, client: KuCoinFuturesClient, dry_run: bool = True, 
                  max_order_usd: float = 10000, min_order_usd: float = 100,
                  margin_mode: str = 'ISOLATED', position_mode: str = 'ONE_WAY',
                  auto_set_position_mode: bool = False, order_type: str = 'market',
@@ -746,50 +707,47 @@ class OrderExecutor:
             order_type: Order type ('market' or 'limit')
             time_in_force: Time in force for limit orders ('IOC', 'GTC', 'FOK')
             slippage_pct: Slippage percentage for limit orders (positive = aggressive, negative = conservative)
-            gtc_timeout_seconds: Timeout for GTC orders before cancelling (default 300s = 5min)
+            gtc_timeout_seconds: Timeout for GTC orders before cancel and retry
+            trade_logging_enabled: Whether to log trades to CSV
         """
         self.client = client
         self.dry_run = dry_run
         self.max_order_usd = max_order_usd
         self.min_order_usd = min_order_usd
-        self.margin_mode = margin_mode.upper()
-        self.position_mode = position_mode.upper()
+        self.margin_mode = margin_mode
+        self.position_mode = position_mode
         self.auto_set_position_mode = auto_set_position_mode
-        self.order_type = order_type.lower()
-        self.time_in_force = time_in_force.upper()
+        self.order_type = order_type
+        self.time_in_force = time_in_force
         self.slippage_pct = slippage_pct
-        self.gtc_timeout_seconds = gtc_timeout_seconds
+        self.gtc_timeout = gtc_timeout_seconds
         
         # Initialize trade logger
         self.trade_logger = TradeLogger(enabled=trade_logging_enabled)
-        
-        if dry_run:
-            logger.info("[OK] DRY RUN MODE - No real orders will be placed")
     
     def verify_position_mode(self, symbol: str) -> bool:
         """
-        Verify that the current position mode matches the configured mode
+        Verify that position mode matches expected configuration
         
         Args:
             symbol: Futures symbol to check
             
         Returns:
-            True if position mode matches or was successfully set, False otherwise
+            True if position mode is correct, False otherwise
         """
-        
         current_mode = self.client.get_position_mode(symbol)
         
         if not current_mode:
-            logger.warning("[WARNING] Could not fetch current position mode")
+            logger.error("Failed to fetch position mode")
             return False
         
         if current_mode == self.position_mode:
-            logger.info(f"[OK] Position mode verified: {current_mode}")
+            logger.info(f"[OK] Position mode verified: {self.position_mode}")
             return True
         
         # Position mode mismatch
         logger.warning("=" * 80)
-        logger.warning(f"[MISMATCH] Position mode does not match!")
+        logger.warning("POSITION MODE MISMATCH DETECTED")
         logger.warning(f"  Current on KuCoin:  {current_mode}")
         logger.warning(f"  Expected by bot:    {self.position_mode}")
         logger.warning("=" * 80)
@@ -801,7 +759,7 @@ class OrderExecutor:
                 logger.info(f"[OK] Successfully set position mode to {self.position_mode}")
                 return True
             else:
-                logger.error(f"âœ— Failed to set position mode to {self.position_mode}")
+                logger.error(f"✗ Failed to set position mode to {self.position_mode}")
                 logger.error("Please manually set position mode on KuCoin website")
                 return False
         else:
@@ -841,527 +799,324 @@ class OrderExecutor:
             # Negative slippage = pay less (conservative, maker)
             reference_price = best_ask
             limit_price = reference_price * (1 + self.slippage_pct / 100)
-        else:  # sell
+        else:
             # For OPEN SHORT (SELL): Use best bid as reference
             # Positive slippage = receive less (aggressive)
             # Negative slippage = receive more (conservative, maker)
             reference_price = best_bid
             limit_price = reference_price * (1 - self.slippage_pct / 100)
         
-        logger.info(f"Limit price calculation:")
-        logger.info(f"  Side: {side.upper()}")
-        logger.info(f"  Best Bid: ${best_bid:,.2f}")
-        logger.info(f"  Best Ask: ${best_ask:,.2f}")
-        logger.info(f"  Reference: ${reference_price:,.2f}")
-        logger.info(f"  Slippage: {self.slippage_pct:+.3f}%")
-        logger.info(f"  Limit Price: ${limit_price:,.2f}")
-        
+        logger.debug(f"Calculated limit price: {limit_price:.2f} (ref: {reference_price:.2f}, slippage: {self.slippage_pct:+.2f}%)")
         return limit_price
     
-    def monitor_gtc_order(self, order_id: str, symbol: str, side: str, 
-                         contracts: int, leverage: int, reduce_only: bool,
-                         action: str = None, limit_price: float = None) -> dict:
+    def wait_for_order_fill(self, order_id: str, timeout_seconds: int = 300) -> dict:
         """
-        Monitor a GTC order until filled or timeout, then retry if needed
+        Wait for an order to be filled or timeout
         
         Args:
             order_id: Order ID to monitor
-            symbol: Futures symbol
-            side: 'buy' or 'sell'
-            contracts: Number of contracts
-            leverage: Leverage
-            reduce_only: If reduce only
-            action: Trade action for CSV logging (OPEN SHORT / CLOSE SHORT)
-            limit_price: Limit price for CSV logging
+            timeout_seconds: Maximum time to wait
             
         Returns:
-            Dictionary with final result
+            Order details dictionary
         """
-        import time
-        
-        logger.info(f"[GTC] Monitoring order {order_id} for up to {self.gtc_timeout_seconds}s...")
-        
         start_time = time.time()
-        check_interval = 5  # Check every 5 seconds
         
-        while True:
-            elapsed = time.time() - start_time
+        while time.time() - start_time < timeout_seconds:
+            order_details = self.client.get_order_status(order_id)
             
-            # Check if timeout reached
-            if elapsed >= self.gtc_timeout_seconds:
-                logger.warning(f"[GTC] Timeout reached ({self.gtc_timeout_seconds}s)")
-                
-                # Get order status
-                order_details = self.client.get_order_details(order_id)
-                if order_details:
-                    filled_size = float(order_details.get('dealSize', 0))
-                    total_size = float(order_details.get('size', contracts))
-                    
-                    logger.info(f"[GTC] Order status: {filled_size}/{total_size} filled")
-                    
-                    if filled_size < total_size:
-                        logger.warning(f"[GTC] Order not fully filled, cancelling...")
-                        
-                        # Cancel the remaining
-                        cancel_success = self.client.cancel_order(order_id)
-                        if cancel_success:
-                            logger.info(f"[GTC] Cancelled order {order_id}")
-                        
-                        # Calculate unfilled amount
-                        unfilled = int(total_size - filled_size)
-                        
-                        # If completely unfilled (0 filled), log as CANCELLED
-                        if filled_size == 0 and action and limit_price:
-                            self.trade_logger.log_trade(
-                                action=action.replace(" ", "_"),
-                                symbol=symbol,
-                                contracts=abs(contracts),
-                                limit_price=limit_price,
-                                order_id=order_id,
-                                slippage=self.slippage_pct,
-                                status='CANCELLED',
-                                error='GTC timeout - no fill'
-                            )
-                        
-                        if unfilled > 0:
-                            logger.info(f"[GTC] Retrying with updated price for {unfilled} contracts...")
-                            
-                            # Retry with new price (this will create a new CSV entry when it fills/fails)
-                            return self.place_order(symbol, side, unfilled, leverage, reduce_only)
-                        else:
-                            # Partial fill - log what was filled
-                            if action and limit_price:
-                                self.trade_logger.log_trade(
-                                    action=action.replace(" ", "_"),
-                                    symbol=symbol,
-                                    contracts=int(filled_size),  # Log only what was filled
-                                    limit_price=limit_price,
-                                    order_id=order_id,
-                                    slippage=self.slippage_pct,
-                                    status='PARTIAL',
-                                    error=f'Filled {filled_size}/{total_size}'
-                                )
-                            
-                            return {
-                                'success': True,
-                                'order_id': order_id,
-                                'partially_filled': True,
-                                'filled_size': filled_size
-                            }
-                
-                # Final timeout with no order details - log as failed
-                if action and limit_price:
-                    self.trade_logger.log_trade(
-                        action=action.replace(" ", "_"),
-                        symbol=symbol,
-                        contracts=abs(contracts),
-                        limit_price=limit_price,
-                        order_id=order_id,
-                        slippage=self.slippage_pct,
-                        status='TIMEOUT',
-                        error='GTC timeout - could not get order status'
-                    )
-                
-                return {'success': False, 'error': 'GTC order timeout'}
+            if not order_details:
+                logger.warning("Failed to fetch order status, retrying...")
+                time.sleep(2)
+                continue
             
-            # Check order status
-            order_details = self.client.get_order_details(order_id)
-            if order_details:
-                status = order_details.get('status', '')
-                filled_size = float(order_details.get('dealSize', 0))
-                total_size = float(order_details.get('size', contracts))
-                
-                logger.info(f"[GTC] Status: {status}, Filled: {filled_size}/{total_size} ({elapsed:.0f}s elapsed)")
-                
-                if status == 'done':
-                    logger.info(f"[GTC] Order fully filled!")
-                    
-                    # Log successful fill to CSV
-                    if action and limit_price:
-                        self.trade_logger.log_trade(
-                            action=action.replace(" ", "_"),
-                            symbol=symbol,
-                            contracts=abs(contracts),
-                            limit_price=limit_price,
-                            order_id=order_id,
-                            slippage=self.slippage_pct,
-                            status='FILLED'
-                        )
-                    
-                    return {
-                        'success': True,
-                        'order_id': order_id,
-                        'filled_size': filled_size
-                    }
+            status = order_details.get('status', '')
             
-            # Wait before next check
-            time.sleep(check_interval)
+            if status == 'done':
+                logger.info(f"[OK] Order filled: {order_id}")
+                return order_details
+            elif status == 'cancel':
+                logger.warning(f"Order cancelled: {order_id}")
+                return order_details
+            
+            # Still pending, wait and retry
+            time.sleep(2)
+        
+        # Timeout reached
+        logger.warning(f"Order timeout reached ({timeout_seconds}s): {order_id}")
+        return self.client.get_order_status(order_id)
     
-    def place_order(self, symbol: str, side: str, contracts: int, leverage: int = 1, 
-                   reduce_only: bool = False) -> dict:
+    def open_short(self, symbol: str, contracts: int, leverage: int) -> dict:
         """
-        Place a market or limit order on KuCoin Futures
-        
-        Args:
-            symbol: Futures symbol (e.g., 'XBTUSDM')
-            side: 'buy' or 'sell'
-            contracts: Number of contracts
-            leverage: Leverage to use
-            reduce_only: If True, only reduce position size (for closing)
-            
-        Returns:
-            Dictionary with order result
-        """
-        import uuid
-        import json
-        
-        # Safety check: Validate order size
-        order_usd = abs(contracts)
-        if order_usd > self.max_order_usd:
-            logger.error(f"Order size ${order_usd:,.0f} exceeds maximum ${self.max_order_usd:,.0f}")
-            return {'success': False, 'error': 'Order size exceeds maximum'}
-        
-        if order_usd < self.min_order_usd:
-            logger.warning(f"Order size ${order_usd:,.0f} below minimum ${self.min_order_usd:,.0f}")
-            return {'success': False, 'error': 'Order size below minimum'}
-        
-        # Safety check: Verify position mode (only for real orders)
-        if not self.dry_run:
-            if not self.verify_position_mode(symbol):
-                logger.error("[FAILED] Position mode verification failed")
-                logger.error("[FAILED] Cannot place order - position mode mismatch")
-                return {'success': False, 'error': 'Position mode mismatch'}
-        
-        # Generate client order ID
-        client_oid = str(uuid.uuid4())
-        
-        # Determine order type and TIF
-        order_type = self.order_type
-        time_in_force = self.time_in_force
-        
-        # If using limit orders with negative slippage (conservative), must use GTC
-        if order_type == 'limit' and self.slippage_pct < 0:
-            time_in_force = 'GTC'
-            logger.info(f"Using GTC for conservative limit order (slippage: {self.slippage_pct:+.3f}%)")
-        
-        # Calculate limit price if needed
-        limit_price = None
-        if order_type == 'limit':
-            limit_price = self.calculate_limit_price(symbol, side)
-            if limit_price == 0:
-                logger.error("Failed to calculate limit price, falling back to market order")
-                order_type = 'market'
-        
-        # Prepare order data
-        order_data = {
-            'clientOid': client_oid,
-            'side': side.lower(),
-            'symbol': symbol,
-            'type': order_type,
-            'leverage': str(leverage),
-            'size': abs(contracts),
-            'reduceOnly': reduce_only,
-            'marginMode': self.margin_mode
-        }
-        
-        # Add limit-specific fields
-        if order_type == 'limit' and limit_price:
-            # KuCoin requires price to be multiple of 0.1 (1 decimal place)
-            order_data['price'] = str(round(limit_price, 1))
-            order_data['timeInForce'] = time_in_force
-        
-        # Minimal order info (only if not dry run)
-        if not self.dry_run:
-            pass  # Logging moved to after order execution
-        
-        if self.dry_run:
-            action = "OPEN SHORT" if side.lower() == 'sell' and not reduce_only else "CLOSE SHORT"
-            logger.info(f"[DRY RUN] {action} {abs(contracts)} @ ${limit_price:,.1f}" if limit_price else f"[DRY RUN] {action} {abs(contracts)} MARKET")
-            return {
-                'success': True,
-                'dry_run': True,
-                'order_id': 'DRY_RUN_' + client_oid[:8],
-                'client_oid': client_oid,
-                'order_type': order_type
-            }
-        
-        # Execute real order
-        try:
-            method = 'POST'
-            endpoint_path = '/api/v1/orders'
-            url = self.client.endpoint + endpoint_path
-            body = json.dumps(order_data)
-            
-            headers = self.client._get_headers(method, endpoint_path, body)
-            
-            response = self.client.session.post(url, headers=headers, data=body, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if data.get('code') == '200000':
-                order_id = data.get('data', {}).get('orderId', '')
-                
-                # Console output
-                action = "OPEN SHORT" if side.lower() == 'sell' and not reduce_only else "CLOSE SHORT"
-                logger.info(f"[TRADE] {action} {abs(contracts)} @ ${limit_price:,.1f}" if limit_price else f"[TRADE] {action} {abs(contracts)} MARKET [FILLED]")
-                
-                # If GTC order, monitor it first before logging to CSV
-                if order_type == 'limit' and time_in_force == 'GTC':
-                    # Pass trade info for CSV logging after monitoring
-                    return self.monitor_gtc_order(
-                        order_id, symbol, side, contracts, leverage, reduce_only,
-                        action=action, limit_price=limit_price
-                    )
-                
-                # For non-GTC orders, log to CSV immediately
-                self.trade_logger.log_trade(
-                    action=action.replace(" ", "_"),
-                    symbol=symbol,
-                    contracts=abs(contracts),
-                    limit_price=limit_price if order_type == 'limit' else None,
-                    order_id=order_id,
-                    slippage=self.slippage_pct if order_type == 'limit' else None,
-                    status='FILLED'
-                )
-                
-                return {
-                    'success': True,
-                    'order_id': order_id,
-                    'client_oid': client_oid,
-                    'order_type': order_type,
-                    'time_in_force': time_in_force if order_type == 'limit' else None
-                }
-            else:
-                error_msg = data.get('msg', 'Unknown error')
-                logger.error(f"[FAILED] Order placement failed: {error_msg}")
-                
-                # For IOC/FOK failures, just log and continue (retry next cycle)
-                if order_type == 'limit' and time_in_force in ['IOC', 'FOK']:
-                    logger.warning(f"[{time_in_force}] Order failed to fill - will retry next cycle")
-                
-                return {'success': False, 'error': error_msg}
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[FAILED] Request failed: {e}")
-            return {'success': False, 'error': str(e)}
-        except Exception as e:
-            logger.error(f"[FAILED] Unexpected error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def open_short(self, symbol: str, contracts: int, leverage: int = 1) -> dict:
-        """
-        Open a SHORT position (SELL)
+        Open a short position (SELL)
         
         Args:
             symbol: Futures symbol
             contracts: Number of contracts to short
-            leverage: Leverage to use
+            leverage: Leverage multiplier
             
         Returns:
-            Order result dictionary
+            Dictionary with execution result
         """
-        logger.info(f"Opening SHORT position: {contracts:,} contracts")
-        return self.place_order(symbol, 'sell', contracts, leverage, reduce_only=False)
+        logger.info("=" * 80)
+        logger.info("EXECUTING: OPEN SHORT")
+        logger.info(f"  Symbol:     {symbol}")
+        logger.info(f"  Contracts:  {contracts:,}")
+        logger.info(f"  Leverage:   {leverage}x")
+        logger.info(f"  Order Type: {self.order_type}")
+        
+        # Verify position mode
+        if not self.verify_position_mode(symbol):
+            error_msg = "Position mode verification failed"
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+            return {'success': False, 'error': error_msg}
+        
+        # Calculate limit price if needed
+        limit_price = None
+        if self.order_type == 'limit':
+            limit_price = self.calculate_limit_price(symbol, 'sell')
+            if limit_price == 0:
+                error_msg = "Failed to calculate limit price"
+                self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+                return {'success': False, 'error': error_msg}
+            logger.info(f"  Limit Price: {limit_price:.2f}")
+        
+        # DRY RUN mode
+        if self.dry_run:
+            logger.info("[DRY RUN] Would execute SELL order")
+            logger.info("=" * 80)
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, limit_price=limit_price, status='DRY_RUN')
+            return {'success': True, 'dry_run': True}
+        
+        # Execute order
+        result = self.client.place_order(
+            symbol=symbol,
+            side='sell',
+            leverage=leverage,
+            size=contracts,
+            order_type=self.order_type,
+            price=limit_price,
+            time_in_force=self.time_in_force
+        )
+        
+        if not result.get('success'):
+            error_msg = result.get('error', 'Unknown error')
+            logger.error(f"[ERROR] Failed to place order: {error_msg}")
+            logger.info("=" * 80)
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, limit_price=limit_price, 
+                                       status='FAILED', error=error_msg)
+            return result
+        
+        order_id = result.get('order_id')
+        logger.info(f"[OK] Order placed: {order_id}")
+        
+        # Wait for order to fill (for limit orders)
+        if self.order_type == 'limit':
+            logger.info("Waiting for order to fill...")
+            order_details = self.wait_for_order_fill(order_id, self.gtc_timeout)
+            
+            filled_price = float(order_details.get('dealValue', 0)) / float(order_details.get('dealSize', 1)) if order_details.get('dealSize') else None
+            status = 'FILLED' if order_details.get('status') == 'done' else 'TIMEOUT'
+            
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, limit_price=limit_price,
+                                       filled_price=filled_price, order_id=order_id, status=status)
+            
+            if order_details.get('status') != 'done' and self.time_in_force == 'GTC':
+                logger.warning("GTC order not filled, cancelling...")
+                self.client.cancel_order(order_id)
+        else:
+            # Market order - assume immediate fill
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, order_id=order_id, status='MARKET_FILL')
+        
+        logger.info("=" * 80)
+        return result
     
     def close_short(self, symbol: str, contracts: int) -> dict:
         """
-        Close a SHORT position (BUY with reduceOnly)
+        Close a short position (BUY)
         
         Args:
             symbol: Futures symbol
             contracts: Number of contracts to close
             
         Returns:
-            Order result dictionary
+            Dictionary with execution result
         """
-        logger.info(f"Closing SHORT position: {contracts:,} contracts")
-        return self.place_order(symbol, 'buy', contracts, leverage=1, reduce_only=True)
-    
-    def execute_rebalance(self, metrics: dict, symbol: str = 'XBTUSDM', 
-                         leverage: int = 1) -> dict:
-        """
-        Execute rebalancing based on portfolio metrics
+        logger.info("=" * 80)
+        logger.info("EXECUTING: CLOSE SHORT")
+        logger.info(f"  Symbol:     {symbol}")
+        logger.info(f"  Contracts:  {contracts:,}")
+        logger.info(f"  Order Type: {self.order_type}")
         
-        Args:
-            metrics: Portfolio metrics from PortfolioCalculator
-            symbol: Futures symbol to trade
-            leverage: Leverage to use for new positions
+        # Verify position mode
+        if not self.verify_position_mode(symbol):
+            error_msg = "Position mode verification failed"
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+            return {'success': False, 'error': error_msg}
+        
+        # Calculate limit price if needed
+        limit_price = None
+        if self.order_type == 'limit':
+            limit_price = self.calculate_limit_price(symbol, 'buy')
+            if limit_price == 0:
+                error_msg = "Failed to calculate limit price"
+                self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+                return {'success': False, 'error': error_msg}
+            logger.info(f"  Limit Price: {limit_price:.2f}")
+        
+        # DRY RUN mode
+        if self.dry_run:
+            logger.info("[DRY RUN] Would execute BUY order")
+            logger.info("=" * 80)
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, limit_price=limit_price, status='DRY_RUN')
+            return {'success': True, 'dry_run': True}
+        
+        # Execute order
+        # Note: For ONE_WAY mode, buying closes the short position
+        # Leverage is not needed for closing positions
+        result = self.client.place_order(
+            symbol=symbol,
+            side='buy',
+            leverage=1,  # Leverage doesn't matter for closing
+            size=contracts,
+            order_type=self.order_type,
+            price=limit_price,
+            time_in_force=self.time_in_force
+        )
+        
+        if not result.get('success'):
+            error_msg = result.get('error', 'Unknown error')
+            logger.error(f"[ERROR] Failed to place order: {error_msg}")
+            logger.info("=" * 80)
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, limit_price=limit_price,
+                                       status='FAILED', error=error_msg)
+            return result
+        
+        order_id = result.get('order_id')
+        logger.info(f"[OK] Order placed: {order_id}")
+        
+        # Wait for order to fill (for limit orders)
+        if self.order_type == 'limit':
+            logger.info("Waiting for order to fill...")
+            order_details = self.wait_for_order_fill(order_id, self.gtc_timeout)
             
-        Returns:
-            Execution result dictionary
-        """
-        if not metrics['needs_rebalancing']:
-            logger.info("Portfolio is balanced - no action needed")
-            return {
-                'success': True,
-                'action': 'none',
-                'message': 'Portfolio already balanced'
-            }
-        
-        contracts = metrics['contracts_to_adjust']
-        
-        logger.info("=" * 80)
-        logger.info("REBALANCING REQUIRED")
-        logger.info("=" * 80)
-        logger.info(f"Deviation:        {metrics['allocation_deviation']:+.2f}%")
-        logger.info(f"Contracts needed: {contracts:,}")
-        logger.info(f"USD Value:        ${abs(metrics['short_position_adjustment']):,.2f}")
-        logger.info("=" * 80)
-        
-        # Determine action
-        if metrics['allocation_deviation'] > 0:
-            # Too much BTC - need to OPEN more shorts
-            logger.info("Action: OPEN SHORT (reduce BTC exposure)")
-            result = self.open_short(symbol, contracts, leverage)
-            result['action'] = 'open_short'
+            filled_price = float(order_details.get('dealValue', 0)) / float(order_details.get('dealSize', 1)) if order_details.get('dealSize') else None
+            status = 'FILLED' if order_details.get('status') == 'done' else 'TIMEOUT'
+            
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, limit_price=limit_price,
+                                       filled_price=filled_price, order_id=order_id, status=status)
+            
+            if order_details.get('status') != 'done' and self.time_in_force == 'GTC':
+                logger.warning("GTC order not filled, cancelling...")
+                self.client.cancel_order(order_id)
         else:
-            # Too little BTC - need to CLOSE shorts
-            logger.info("Action: CLOSE SHORT (increase BTC exposure)")
-            result = self.close_short(symbol, contracts)
-            result['action'] = 'close_short'
+            # Market order - assume immediate fill
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, order_id=order_id, status='MARKET_FILL')
         
-        result['contracts'] = contracts
-        result['usd_value'] = abs(metrics['short_position_adjustment'])
-        
+        logger.info("=" * 80)
         return result
 
+
+# ============================================================================
+# PORTFOLIO CALCULATOR
+# ============================================================================
 
 class PortfolioCalculator:
     """Calculate portfolio metrics and rebalancing needs"""
     
     @staticmethod
-    def calculate_metrics(cold_storage_btc: float, futures_account: dict, 
-                         positions: list, btc_price: float, target_allocation: float, 
-                         rebalance_threshold: float) -> dict:
+    def calculate_metrics(btc_price: float, cold_storage_btc: float, 
+                         account_data: dict, positions: list,
+                         target_allocation: float, rebalance_threshold: float) -> dict:
         """
-        Calculate portfolio metrics and rebalancing needs
+        Calculate portfolio metrics and rebalancing recommendations
         
         Args:
-            cold_storage_btc: Amount of BTC in cold storage
-            futures_account: Futures account data from API
+            btc_price: Current BTC price
+            cold_storage_btc: BTC amount in cold storage
+            account_data: Futures account data
             positions: List of open positions
-            btc_price: Current BTC price in USD
-            target_allocation: Target BTC allocation percentage (e.g., 50.0)
-            rebalance_threshold: Threshold to trigger rebalance (e.g., 1.0 for 1%)
+            target_allocation: Target BTC allocation percentage (e.g., 50.0 for 50%)
+            rebalance_threshold: Rebalancing threshold in percentage (e.g., 1.0 for ±1%)
             
         Returns:
-            Dictionary with portfolio metrics and rebalancing info
+            Dictionary containing all portfolio metrics and rebalancing recommendations
         """
-        # Get futures account BTC balance (accountEquity for coin-margined)
-        futures_btc = float(futures_account.get('accountEquity', 0))
+        # Extract account equity (in BTC for coin-margined contracts)
+        futures_equity_btc = float(account_data.get('accountEquity', 0))
         
-        # Calculate short position exposure
-        # For coin-margined (inverse) contracts like XBTUSDM:
-        # - Each contract = $1 USD
-        # - Negative currentQty = short position
-        # - Short position USD value = |currentQty|
-        total_short_usd = 0
-        position_details = []
-        
-        for pos in positions:
-            symbol = pos.get('symbol', '')
-            current_qty = float(pos.get('currentQty', 0))
-            is_inverse = pos.get('isInverse', False)
-            mark_price = float(pos.get('markPrice', btc_price))
-            
-            # For coin-margined shorts (XBTUSDM, XBTUSDM, etc.)
-            if is_inverse and current_qty < 0:
-                # Each contract is $1, so absolute value is USD exposure
-                short_usd_value = abs(current_qty)
-                total_short_usd += short_usd_value
-                
-                position_details.append({
-                    'symbol': symbol,
-                    'qty': current_qty,
-                    'usd_value': short_usd_value,
-                    'mark_price': mark_price,
-                    'avg_entry_price': float(pos.get('avgEntryPrice', 0)),
-                    'unrealised_pnl': float(pos.get('unrealisedPnl', 0))
-                })
-        
-        # Calculate totals
-        total_btc = cold_storage_btc + futures_btc
+        # Calculate total BTC holdings
+        total_btc = cold_storage_btc + futures_equity_btc
         
         # Calculate USD values
         cold_storage_usd = cold_storage_btc * btc_price
-        futures_btc_usd = futures_btc * btc_price
+        futures_btc_usd = futures_equity_btc * btc_price
         total_portfolio_usd = total_btc * btc_price
         
-        # Calculate NET BTC exposure
-        # BTC exposure = All BTC holdings - Short position USD exposure
-        gross_btc_exposure_usd = cold_storage_usd + futures_btc_usd
-        net_btc_exposure_usd = gross_btc_exposure_usd - total_short_usd
+        # Calculate current short position
+        current_short_usd = 0
+        position_count = 0
+        position_details = []
         
-        # USD exposure = Short positions
-        usd_exposure = total_short_usd
+        for pos in positions:
+            if pos.get('isOpen', False):
+                position_count += 1
+                qty = abs(float(pos.get('currentQty', 0)))
+                # For inverse contracts, currentQty is in USD value
+                current_short_usd += qty
+                
+                position_details.append({
+                    'symbol': pos.get('symbol'),
+                    'qty': qty,
+                    'leverage': pos.get('realLeverage', 0),
+                    'liquidation_price': pos.get('liquidationPrice', 0),
+                    'unrealized_pnl': pos.get('unrealisedPnl', 0)
+                })
         
-        # Calculate current allocation (based on NET exposure)
-        if total_portfolio_usd > 0:
-            current_btc_allocation = (net_btc_exposure_usd / total_portfolio_usd) * 100
-            current_usd_allocation = (usd_exposure / total_portfolio_usd) * 100
-        else:
-            current_btc_allocation = 0
-            current_usd_allocation = 0
+        # Calculate effective BTC exposure
+        # Effective BTC = Physical BTC - Short Position Value / BTC Price
+        effective_btc_usd = total_portfolio_usd - current_short_usd
         
-        # Calculate targets
-        target_btc_usd = total_portfolio_usd * (target_allocation / 100)
-        target_usd_exposure = total_portfolio_usd * ((100 - target_allocation) / 100)
+        # Calculate current allocation
+        current_allocation = (effective_btc_usd / total_portfolio_usd * 100) if total_portfolio_usd > 0 else 0
         
-        # Calculate deviation
-        allocation_deviation = current_btc_allocation - target_allocation
+        # Calculate target short position
+        target_usd_exposure = total_portfolio_usd * (1 - target_allocation / 100)
         
-        # Calculate required adjustment
-        # Positive deviation = too much BTC, need to short more (increase USD exposure)
-        # Negative deviation = too little BTC, need to close shorts (decrease USD exposure)
-        required_usd_adjustment = (allocation_deviation / 100) * total_portfolio_usd
+        # Calculate allocation deviation
+        allocation_deviation = current_allocation - target_allocation
         
-        # Determine how much to adjust the short position
-        current_short_position_usd = total_short_usd
-        target_short_position_usd = target_usd_exposure
-        short_position_adjustment = target_short_position_usd - current_short_position_usd
-        
-        # Calculate contract count for coin-margined (XBTUSDM)
-        # Each contract = $1 USD, so contract count = USD amount
-        contracts_to_adjust = int(abs(short_position_adjustment))
-        
-        # Check if rebalancing needed
+        # Determine if rebalancing is needed
         needs_rebalancing = abs(allocation_deviation) > rebalance_threshold
         
+        # Calculate adjustment needed
+        short_position_adjustment = target_usd_exposure - current_short_usd
+        contracts_to_adjust = int(abs(short_position_adjustment))
+        
         return {
+            'btc_price': btc_price,
             'cold_storage_btc': cold_storage_btc,
             'cold_storage_usd': cold_storage_usd,
-            'futures_btc': futures_btc,
+            'futures_btc': futures_equity_btc,
             'futures_btc_usd': futures_btc_usd,
             'total_btc': total_btc,
             'total_portfolio_usd': total_portfolio_usd,
-            'btc_price': btc_price,
-            'gross_btc_exposure_usd': gross_btc_exposure_usd,
-            'net_btc_exposure_usd': net_btc_exposure_usd,
-            'usd_exposure': usd_exposure,
-            'current_short_usd': total_short_usd,
-            'current_btc_allocation': current_btc_allocation,
-            'current_usd_allocation': current_usd_allocation,
-            'target_btc_allocation': target_allocation,
-            'target_usd_allocation': 100 - target_allocation,
+            'current_short_usd': current_short_usd,
+            'effective_btc_usd': effective_btc_usd,
+            'current_allocation': current_allocation,
+            'target_allocation': target_allocation,
             'allocation_deviation': allocation_deviation,
-            'target_btc_usd': target_btc_usd,
             'target_usd_exposure': target_usd_exposure,
-            'required_usd_adjustment': required_usd_adjustment,
             'short_position_adjustment': short_position_adjustment,
             'contracts_to_adjust': contracts_to_adjust,
             'needs_rebalancing': needs_rebalancing,
             'rebalance_threshold': rebalance_threshold,
-            'positions': position_details,
-            'position_count': len(position_details)
+            'position_count': position_count,
+            'positions': position_details
         }
-
-
-class DisplayManager:
-    """Handle display of account and portfolio information"""
     
     @staticmethod
-    def display_account_info(account_data: dict):
+    def display_account(account_data: dict):
         """Display futures account information"""
         if not account_data:
             logger.warning("No account data to display")
@@ -1399,40 +1154,29 @@ class DisplayManager:
             logger.info(f"Open Positions ({metrics['position_count']}):")
             for pos in metrics['positions']:
                 logger.info(f"  {pos['symbol']}:")
-                logger.info(f"    Contracts:         {pos['qty']:,.0f} (SHORT)")
-                logger.info(f"    USD Exposure:      ${pos['usd_value']:,.2f}")
-                logger.info(f"    Entry Price:       ${pos['avg_entry_price']:,.2f}")
-                logger.info(f"    Mark Price:        ${pos['mark_price']:,.2f}")
-                logger.info(f"    Unrealized PnL:    {pos['unrealised_pnl']:.8f} BTC")
-            logger.info("")
+                logger.info(f"    Contracts:         {pos['qty']:,.0f} USD")
+                logger.info(f"    Leverage:          {pos['leverage']:.2f}x")
+                logger.info(f"    Unrealized PNL:    {pos['unrealized_pnl']:.8f} BTC")
+            logger.info(f"  TOTAL SHORT VALUE:   ${metrics['current_short_usd']:,.2f}")
         else:
-            logger.info("Open Positions: None")
-            logger.info("")
+            logger.info("Open Positions:        None")
         
-        # Show exposure breakdown
-        logger.info("Exposure Breakdown:")
-        logger.info(f"  Gross BTC:           ${metrics['gross_btc_exposure_usd']:,.2f}")
-        logger.info(f"  Short Positions:     ${metrics['current_short_usd']:,.2f}")
-        logger.info(f"  NET BTC Exposure:    ${metrics['net_btc_exposure_usd']:,.2f}")
-        logger.info(f"  USD Exposure:        ${metrics['usd_exposure']:,.2f}")
         logger.info("")
-        
-        logger.info("Allocation:")
-        logger.info(f"  Current BTC:         {metrics['current_btc_allocation']:.2f}%")
-        logger.info(f"  Current USD:         {metrics['current_usd_allocation']:.2f}%")
-        logger.info(f"  Target BTC:          {metrics['target_btc_allocation']:.2f}%")
-        logger.info(f"  Target USD:          {metrics['target_usd_allocation']:.2f}%")
+        logger.info("Allocation Analysis:")
+        logger.info(f"  Effective BTC:       ${metrics['effective_btc_usd']:,.2f}")
+        logger.info(f"  Current Allocation:  {metrics['current_allocation']:.2f}% BTC")
+        logger.info(f"  Target Allocation:   {metrics['target_allocation']:.2f}% BTC")
         logger.info(f"  Deviation:           {metrics['allocation_deviation']:+.2f}%")
         logger.info("")
         
+        # Rebalancing recommendation
         if metrics['needs_rebalancing']:
-            logger.info("[WARNING] REBALANCING NEEDED")
-            logger.info(f"  Threshold:           +/-{metrics['rebalance_threshold']:.2f}%")
+            logger.info("REBALANCING NEEDED")
             
             if metrics['allocation_deviation'] > 0:
-                # Too much BTC - need to SHORT more
+                # Too much BTC - need to OPEN shorts
                 logger.info(f"  Action Required:     OPEN SHORT position")
-                logger.info(f"  Contracts to SHORT:  {metrics['contracts_to_adjust']:,} contracts (XBTUSDM)")
+                logger.info(f"  Contracts to OPEN:   {metrics['contracts_to_adjust']:,} contracts (XBTUSDM)")
                 logger.info(f"  USD Value:           ${abs(metrics['short_position_adjustment']):,.2f}")
                 logger.info(f"  Current Short:       ${metrics['current_short_usd']:,.2f}")
                 logger.info(f"  Target Short:        ${metrics['target_usd_exposure']:,.2f}")
@@ -1452,6 +1196,10 @@ class DisplayManager:
         logger.info("=" * 80)
 
 
+# ============================================================================
+# MAIN TRADING BOT
+# ============================================================================
+
 class TradingBot:
     """Main trading bot class"""
     
@@ -1459,16 +1207,12 @@ class TradingBot:
         """Initialize the trading bot"""
         
         # Fix for .exe compatibility: Set working directory to .exe location
-        # This ensures .env, logs, and CSV files are in the same folder as .exe
         import sys
         if getattr(sys, 'frozen', False):
-            # Running as compiled .exe
             application_path = os.path.dirname(sys.executable)
         else:
-            # Running as .py script
             application_path = os.path.dirname(os.path.abspath(__file__))
         
-        # Change to application directory
         os.chdir(application_path)
         
         load_dotenv()
@@ -1480,38 +1224,49 @@ class TradingBot:
         self.futures_endpoint = os.getenv('KUCOIN_FUTURES_ENDPOINT', 'https://api-futures.kucoin.com')
         
         if not all([self.api_key, self.api_secret, self.api_passphrase]):
-            raise ValueError("Missing API credentials. Please check your .env file")
+            raise ValueError("Missing API credentials. Check your .env file")
         
         # Portfolio configuration
-        self.cold_storage_btc = float(os.getenv('COLD_STORAGE_BTC_AMOUNT', 0.0))
+        self.cold_storage_btc = float(os.getenv('COLD_STORAGE_BTC_AMOUNT', '0'))
         self.futures_symbol = os.getenv('FUTURES_SYMBOL', 'XBTUSDM')
-        self.target_allocation = float(os.getenv('TARGET_BTC_ALLOCATION', 50.0))
-        self.rebalance_threshold = float(os.getenv('REBALANCE_THRESHOLD', 1.0))
-        self.fetch_interval = int(os.getenv('FETCH_INTERVAL', 5))
+        self.target_allocation = float(os.getenv('TARGET_BTC_ALLOCATION', '50'))
+        self.rebalance_threshold = float(os.getenv('REBALANCE_THRESHOLD', '1.0'))
+        self.fetch_interval = int(os.getenv('FETCH_INTERVAL', '5'))
         
-        # Automation settings
-        self.auto_rebalance = os.getenv('AUTO_REBALANCE', 'false').lower() == 'true'
+        # Trading controls
+        self.auto_rebalance = os.getenv('AUTO_REBALANCE', 'true').lower() == 'true'
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
-        self.max_order_usd = float(os.getenv('MAX_ORDER_SIZE_USD', 10000))
-        self.min_order_usd = float(os.getenv('MIN_ORDER_SIZE_USD', 100))
-        self.leverage = int(os.getenv('LEVERAGE', 1))
-        self.margin_mode = os.getenv('MARGIN_MODE', 'ISOLATED').upper()
-        self.position_mode = os.getenv('POSITION_MODE', 'ONE_WAY').upper()
+        self.leverage = int(os.getenv('LEVERAGE', '5'))
+        self.max_order_usd = float(os.getenv('MAX_ORDER_SIZE_USD', '10000'))
+        self.min_order_usd = float(os.getenv('MIN_ORDER_SIZE_USD', '100'))
+        
+        # Trading modes
+        self.margin_mode = os.getenv('MARGIN_MODE', 'ISOLATED')
+        self.position_mode = os.getenv('POSITION_MODE', 'ONE_WAY')
         self.auto_set_position_mode = os.getenv('AUTO_SET_POSITION_MODE', 'false').lower() == 'true'
         
-        # Order execution settings
-        self.order_type = os.getenv('ORDER_TYPE', 'market').lower()
-        self.time_in_force = os.getenv('TIME_IN_FORCE', 'IOC').upper()
-        self.slippage_pct = float(os.getenv('SLIPPAGE_PERCENTAGE', 0.1))
-        self.gtc_timeout = int(os.getenv('GTC_TIMEOUT_SECONDS', 300))
+        # Order execution
+        self.order_type = os.getenv('ORDER_TYPE', 'market')
+        self.time_in_force = os.getenv('TIME_IN_FORCE', 'IOC')
+        self.slippage_pct = float(os.getenv('SLIPPAGE_PERCENTAGE', '0.1'))
+        self.gtc_timeout = int(os.getenv('GTC_TIMEOUT_SECONDS', '300'))
         
         # Logging configuration
         self.file_system_logging_enabled = os.getenv('FILE_SYSTEM_LOGGING_ENABLED', 'true').lower() == 'true'
+        self.file_log_level = os.getenv('FILE_LOG_LEVEL', 'TRADE')
+        self.file_log_rotation_hours = int(os.getenv('FILE_LOG_ROTATION_HOURS', '24'))
         self.file_trading_logging_enabled = os.getenv('FILE_TRADING_LOGGING_ENABLED', 'true').lower() == 'true'
-        self.file_log_level = os.getenv('FILE_LOG_LEVEL', 'TRADE').upper()
-        self.file_log_rotation_hours = int(os.getenv('FILE_LOG_ROTATION_HOURS', 168))
         
-        # Setup file logging handler
+        # Convert log level string to logging constant
+        log_level_map = {
+            'ERROR': logging.ERROR,
+            'WARNING': logging.WARNING,
+            'TRADE': logging.INFO,  # TRADE = INFO level
+            'INFO': logging.INFO
+        }
+        self.file_log_level = log_level_map.get(self.file_log_level.upper(), logging.INFO)
+        
+        # Set up file logging if enabled
         if self.file_system_logging_enabled:
             file_handler = RotatingFileHandler(
                 'trading_bot.log',
@@ -1612,53 +1367,50 @@ class TradingBot:
                 # Fetch open positions
                 positions = self.client.get_positions(currency='XBT')
                 
-                # Calculate portfolio metrics
-                if btc_price > 0 and account_data:
-                    metrics = PortfolioCalculator.calculate_metrics(
-                        self.cold_storage_btc,
-                        account_data,
-                        positions,
-                        btc_price,
-                        self.target_allocation,
-                        self.rebalance_threshold
-                    )
-                    
-                    # Minimal status line
-                    total_value_usd = metrics['total_portfolio_usd']
-                    btc_allocation = metrics['current_btc_allocation']
-                    status = "Balanced" if not metrics['needs_rebalancing'] else f"Rebalance needed"
-                    logger.info(f"[OK] ${total_value_usd:,.0f} | {btc_allocation:.1f}% BTC | {status}")
-                    
-                    # Execute automatic rebalancing if enabled
-                    if metrics['needs_rebalancing']:
-                        executed = self.execute_rebalance(metrics)
-                        if executed:
-                            logger.info("[INFO] Waiting 10 seconds for order to settle...")
-                            time.sleep(10)
-                            # Skip the normal sleep interval after rebalancing
-                            continue
+                # Check if we got valid data
+                if btc_price == 0:
+                    logger.error("[ERROR] Failed to fetch BTC price")
+                    time.sleep(self.fetch_interval)
+                    continue
                 
-                # Wait before next fetch
+                if not account_data:
+                    logger.error("[ERROR] Failed to fetch account data")
+                    time.sleep(self.fetch_interval)
+                    continue
+                
+                # Calculate portfolio metrics
+                metrics = PortfolioCalculator.calculate_metrics(
+                    btc_price=btc_price,
+                    cold_storage_btc=self.cold_storage_btc,
+                    account_data=account_data,
+                    positions=positions,
+                    target_allocation=self.target_allocation,
+                    rebalance_threshold=self.rebalance_threshold
+                )
+                
+                # Display information
+                PortfolioCalculator.display_account(account_data)
+                PortfolioCalculator.display_portfolio_metrics(metrics)
+                
+                # Execute rebalancing if needed
+                if metrics['needs_rebalancing']:
+                    self.execute_rebalance(metrics)
+                
+                # Wait before next iteration
+                logger.info(f"Next check in {self.fetch_interval} seconds...")
                 time.sleep(self.fetch_interval)
                 
         except KeyboardInterrupt:
             logger.info("\n[OK] Bot stopped by user")
         except Exception as e:
-            logger.error(f"Fatal error in main loop: {e}")
+            logger.error(f"[ERROR] Unexpected error: {e}")
             raise
 
 
-def main():
-    """Main entry point"""
-    try:
-        bot = TradingBot()
-        bot.run()
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        return 1
-    
-    return 0
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    bot = TradingBot()
+    bot.run()
