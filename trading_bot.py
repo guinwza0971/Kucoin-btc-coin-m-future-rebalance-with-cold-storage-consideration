@@ -910,23 +910,45 @@ class OrderExecutor:
         order_id = result.get('order_id')
         logger.info(f"[OK] Order placed: {order_id}")
         
-        # Wait for order to fill (for limit orders)
+        # Wait for order to fill and get execution price
+        # For BOTH market and limit orders, we need to fetch the filled price
         if self.order_type == 'limit':
-            logger.info("Waiting for order to fill...")
+            logger.info("Waiting for limit order to fill...")
             order_details = self.wait_for_order_fill(order_id, self.gtc_timeout)
-            
-            filled_price = float(order_details.get('dealValue', 0)) / float(order_details.get('dealSize', 1)) if order_details.get('dealSize') else None
-            status = 'FILLED' if order_details.get('status') == 'done' else 'TIMEOUT'
-            
-            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, limit_price=limit_price,
-                                       filled_price=filled_price, order_id=order_id, status=status)
-            
-            if order_details.get('status') != 'done' and self.time_in_force == 'GTC':
-                logger.warning("GTC order not filled, cancelling...")
-                self.client.cancel_order(order_id)
         else:
-            # Market order - assume immediate fill
-            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, order_id=order_id, status='MARKET_FILL')
+            # Market orders fill almost instantly, wait 2 seconds then fetch
+            logger.info("Waiting for market order to fill...")
+            time.sleep(2)
+            order_details = self.client.get_order_status(order_id)
+        
+        # Calculate filled price from order details
+        filled_price = None
+        deal_size = float(order_details.get('dealSize', 0))
+        deal_value = float(order_details.get('dealValue', 0))
+        
+        if deal_size > 0 and deal_value > 0:
+            filled_price = deal_value / deal_size
+            logger.info(f"[OK] Order filled at price: ${filled_price:.2f}")
+        else:
+            logger.warning("Unable to determine filled price from order details")
+        
+        # Determine status
+        order_status = order_details.get('status', '')
+        if order_status == 'done':
+            status = 'FILLED'
+        elif self.order_type == 'limit' and order_status != 'done':
+            status = 'TIMEOUT'
+        else:
+            status = 'MARKET_FILL'
+        
+        # Log trade with filled price
+        self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, limit_price=limit_price,
+                                   filled_price=filled_price, order_id=order_id, status=status)
+        
+        # Cancel unfilled GTC orders
+        if self.order_type == 'limit' and order_status != 'done' and self.time_in_force == 'GTC':
+            logger.warning("GTC order not filled, cancelling...")
+            self.client.cancel_order(order_id)
         
         logger.info("=" * 80)
         return result
@@ -995,23 +1017,45 @@ class OrderExecutor:
         order_id = result.get('order_id')
         logger.info(f"[OK] Order placed: {order_id}")
         
-        # Wait for order to fill (for limit orders)
+        # Wait for order to fill and get execution price
+        # For BOTH market and limit orders, we need to fetch the filled price
         if self.order_type == 'limit':
-            logger.info("Waiting for order to fill...")
+            logger.info("Waiting for limit order to fill...")
             order_details = self.wait_for_order_fill(order_id, self.gtc_timeout)
-            
-            filled_price = float(order_details.get('dealValue', 0)) / float(order_details.get('dealSize', 1)) if order_details.get('dealSize') else None
-            status = 'FILLED' if order_details.get('status') == 'done' else 'TIMEOUT'
-            
-            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, limit_price=limit_price,
-                                       filled_price=filled_price, order_id=order_id, status=status)
-            
-            if order_details.get('status') != 'done' and self.time_in_force == 'GTC':
-                logger.warning("GTC order not filled, cancelling...")
-                self.client.cancel_order(order_id)
         else:
-            # Market order - assume immediate fill
-            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, order_id=order_id, status='MARKET_FILL')
+            # Market orders fill almost instantly, wait 2 seconds then fetch
+            logger.info("Waiting for market order to fill...")
+            time.sleep(2)
+            order_details = self.client.get_order_status(order_id)
+        
+        # Calculate filled price from order details
+        filled_price = None
+        deal_size = float(order_details.get('dealSize', 0))
+        deal_value = float(order_details.get('dealValue', 0))
+        
+        if deal_size > 0 and deal_value > 0:
+            filled_price = deal_value / deal_size
+            logger.info(f"[OK] Order filled at price: ${filled_price:.2f}")
+        else:
+            logger.warning("Unable to determine filled price from order details")
+        
+        # Determine status
+        order_status = order_details.get('status', '')
+        if order_status == 'done':
+            status = 'FILLED'
+        elif self.order_type == 'limit' and order_status != 'done':
+            status = 'TIMEOUT'
+        else:
+            status = 'MARKET_FILL'
+        
+        # Log trade with filled price
+        self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, limit_price=limit_price,
+                                   filled_price=filled_price, order_id=order_id, status=status)
+        
+        # Cancel unfilled GTC orders
+        if self.order_type == 'limit' and order_status != 'done' and self.time_in_force == 'GTC':
+            logger.warning("GTC order not filled, cancelling...")
+            self.client.cancel_order(order_id)
         
         logger.info("=" * 80)
         return result
