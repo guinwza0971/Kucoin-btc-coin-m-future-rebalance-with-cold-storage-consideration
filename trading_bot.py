@@ -184,6 +184,14 @@ class KuCoinFuturesClient:
         self.api_passphrase = self._encrypt_passphrase(api_passphrase, api_secret)
         self.endpoint = endpoint
         self.session = requests.Session()
+        
+        # Server time synchronization
+        self.time_offset = 0  # Offset between local time and server time (in milliseconds)
+        self.last_time_sync = 0  # Last time we synced with server
+        self.sync_interval = 300  # Sync every 5 minutes (300 seconds)
+        
+        # Initial time sync
+        self._sync_server_time()
     
     @staticmethod
     def _encrypt_passphrase(passphrase: str, secret: str) -> str:
@@ -192,9 +200,58 @@ class KuCoinFuturesClient:
             hmac.new(secret.encode('utf-8'), passphrase.encode('utf-8'), hashlib.sha256).digest()
         ).decode('utf-8')
     
+    def _sync_server_time(self):
+        """
+        Synchronize with KuCoin server time
+        
+        This prevents authentication failures due to clock drift on local PC
+        """
+        try:
+            # Get server time without authentication
+            url = self.endpoint + '/api/v1/timestamp'
+            response = self.session.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == '200000':
+                    server_time = int(data.get('data', 0))
+                    local_time = int(time.time() * 1000)
+                    
+                    # Calculate offset
+                    self.time_offset = server_time - local_time
+                    self.last_time_sync = time.time()
+                    
+                    offset_seconds = self.time_offset / 1000
+                    logger.info(f"[OK] Server time synced (offset: {offset_seconds:+.3f}s)")
+                    return True
+            
+            logger.warning("Failed to sync server time, using local time")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Server time sync error: {e}, using local time")
+            return False
+    
+    def _get_server_time(self) -> int:
+        """
+        Get current timestamp synchronized with KuCoin server
+        
+        Returns:
+            Timestamp in milliseconds
+        """
+        # Re-sync if needed (every 5 minutes)
+        if time.time() - self.last_time_sync > self.sync_interval:
+            self._sync_server_time()
+        
+        # Return local time + offset
+        return int(time.time() * 1000) + self.time_offset
+    
     def _get_headers(self, method: str, endpoint_path: str, body: str = '') -> dict:
         """
         Generate authentication headers for KuCoin API v3
+        
+        Uses KuCoin server time instead of local PC time to prevent authentication failures
+        due to clock drift.
         
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -204,7 +261,8 @@ class KuCoinFuturesClient:
         Returns:
             Dictionary of headers
         """
-        timestamp = str(int(time.time() * 1000))
+        # Use server-synchronized timestamp instead of local time
+        timestamp = str(self._get_server_time())
         str_to_sign = timestamp + method + endpoint_path + body
         
         signature = base64.b64encode(
@@ -317,26 +375,27 @@ class KuCoinFuturesClient:
         Get futures account balance
         
         CRITICAL FIX (2026-03-07):
-        KuCoin Futures API changed - /api/v1/account-overview NO LONGER accepts currency parameter
+        KuCoin Futures API requires currency parameter to be EMPTY or the correct currency code
         
         Args:
-            currency: Currency to filter (kept for backward compatibility, not used in API call)
+            currency: Currency to query (XBT, USDT, etc.)
             
         Returns:
-            Dictionary containing account information for the specified currency
+            Dictionary containing account information
         """
-        # UPDATED: KuCoin API no longer accepts currency parameter
-        # The endpoint now returns data for ALL currencies in your futures account
-        # We need to filter the results on our end
+        # CRITICAL: According to KuCoin API docs updated 2026-01-28, the currency parameter
+        # should either be EMPTY (?currency=) OR specify a valid currency
+        # We'll use the currency parameter but handle errors gracefully
         
         method = 'GET'
-        endpoint_path = '/api/v1/account-overview'  # No parameters!
+        # Include currency parameter as KuCoin docs show it's required (even if empty)
+        endpoint_path = f'/api/v1/account-overview?currency={currency}'
         url = self.endpoint + endpoint_path
         
         headers = self._get_headers(method, endpoint_path)
         
         try:
-            logger.debug(f"Fetching futures account overview (filtering for {currency})")
+            logger.debug(f"Fetching futures account overview for {currency}")
             response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             
@@ -344,22 +403,8 @@ class KuCoinFuturesClient:
             
             if data.get('code') == '200000':
                 account_data = data.get('data', {})
-                
-                # The API now returns data for all currencies
-                # We need to check if it's a single currency response or multi-currency
-                
-                # Check if this is the currency we want
-                if account_data.get('currency') == currency:
-                    logger.info(f"[OK] Successfully fetched {currency} futures account")
-                    return account_data
-                
-                # If currency doesn't match, log warning but return data anyway
-                # This handles cases where API returns different currency than requested
-                returned_currency = account_data.get('currency', 'UNKNOWN')
-                logger.warning(f"API returned {returned_currency} account, expected {currency}")
-                logger.warning(f"Using returned account data for calculations")
+                logger.info(f"[OK] Successfully fetched futures account ({account_data.get('currency', 'UNKNOWN')})")
                 return account_data
-                
             else:
                 error_msg = data.get('msg', 'Unknown error')
                 logger.error(f"API Error fetching account: {error_msg}")
@@ -367,6 +412,8 @@ class KuCoinFuturesClient:
                 
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error fetching account: {e}")
+            logger.error(f"URL attempted: {url}")
+            logger.error(f"Headers: KC-API-KEY={self.api_key[:8]}..., KC-API-KEY-VERSION=3")
             return {}
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed fetching account: {e}")
@@ -379,27 +426,21 @@ class KuCoinFuturesClient:
         """
         Get all open positions
         
-        CRITICAL FIX (2026-03-07):
-        KuCoin Futures API changed - /api/v1/positions NO LONGER accepts currency parameter
-        
         Args:
-            currency: Currency to filter positions (kept for backward compatibility)
+            currency: Currency to filter positions
             
         Returns:
             List of position dictionaries
         """
-        # UPDATED: KuCoin API no longer accepts currency parameter
-        # The endpoint now returns ALL positions across all currencies
-        # We filter the results on our end
-        
         method = 'GET'
-        endpoint_path = '/api/v1/positions'  # No parameters!
+        # Include currency parameter in the endpoint
+        endpoint_path = f'/api/v1/positions?currency={currency}'
         url = self.endpoint + endpoint_path
         
         headers = self._get_headers(method, endpoint_path)
         
         try:
-            logger.debug(f"Fetching all positions (will filter for {currency})")
+            logger.debug(f"Fetching positions for {currency}")
             response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             
@@ -411,18 +452,8 @@ class KuCoinFuturesClient:
                 # Filter for open positions only
                 open_positions = [pos for pos in all_positions if pos.get('isOpen', False)]
                 
-                # Filter by currency if specified
-                if currency:
-                    filtered_positions = [
-                        pos for pos in open_positions 
-                        if pos.get('currency') == currency or pos.get('symbol', '').startswith(currency)
-                    ]
-                    logger.info(f"[OK] Successfully fetched positions ({len(filtered_positions)} open {currency} positions)")
-                    return filtered_positions
-                
-                logger.info(f"[OK] Successfully fetched positions ({len(open_positions)} total open positions)")
+                logger.info(f"[OK] Successfully fetched positions ({len(open_positions)} open positions)")
                 return open_positions
-                
             else:
                 error_msg = data.get('msg', 'Unknown error')
                 logger.error(f"API Error fetching positions: {error_msg}")
@@ -536,6 +567,96 @@ class KuCoinFuturesClient:
             return False
         except Exception as e:
             logger.error(f"Unexpected error setting position mode: {e}")
+            return False
+    
+    def get_margin_mode(self, symbol: str) -> str:
+        """
+        Get current margin mode for a symbol
+        
+        Args:
+            symbol: Futures symbol (e.g., 'XBTUSDM')
+            
+        Returns:
+            Margin mode: 'ISOLATED' or 'CROSS', or empty string if error
+        """
+        method = 'GET'
+        endpoint_path = f'/api/v2/position/getMarginMode?symbol={symbol}'
+        url = self.endpoint + endpoint_path
+        
+        headers = self._get_headers(method, endpoint_path)
+        
+        try:
+            response = self.session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get('code') == '200000':
+                margin_mode = data.get('data', {}).get('marginMode', '')
+                logger.info(f"Current margin mode for {symbol}: {margin_mode}")
+                return margin_mode
+            else:
+                logger.error(f"API Error fetching margin mode: {data.get('msg', 'Unknown error')}")
+                return ''
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed fetching margin mode: {e}")
+            return ''
+        except Exception as e:
+            logger.error(f"Unexpected error fetching margin mode: {e}")
+            return ''
+    
+    def set_margin_mode(self, symbol: str, margin_mode: str) -> bool:
+        """
+        Set margin mode for a symbol
+        
+        Args:
+            symbol: Futures symbol (e.g., 'XBTUSDM')
+            margin_mode: 'ISOLATED' or 'CROSS'
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if margin_mode not in ['ISOLATED', 'CROSS']:
+            logger.error(f"Invalid margin mode: {margin_mode}. Must be 'ISOLATED' or 'CROSS'")
+            return False
+        
+        method = 'POST'
+        endpoint_path = '/api/v2/position/changeMarginMode'
+        
+        body_dict = {
+            'symbol': symbol,
+            'marginMode': margin_mode
+        }
+        body = json.dumps(body_dict)
+        
+        url = self.endpoint + endpoint_path
+        headers = self._get_headers(method, endpoint_path, body)
+        
+        try:
+            response = self.session.post(url, headers=headers, data=body, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get('code') == '200000':
+                logger.info(f"[OK] Successfully set margin mode to {margin_mode}")
+                return True
+            else:
+                error_msg = data.get('msg', 'Unknown error')
+                logger.error(f"API Error setting margin mode: {error_msg}")
+                
+                # Check if error is due to open positions/orders
+                if 'position' in error_msg.lower() or 'order' in error_msg.lower():
+                    logger.error("HINT: Close all positions and cancel all orders before switching margin mode")
+                
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed setting margin mode: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error setting margin mode: {e}")
             return False
     
     def place_order(self, symbol: str, side: str, leverage: int, size: int, 
@@ -690,8 +811,8 @@ class OrderExecutor:
     def __init__(self, client: KuCoinFuturesClient, dry_run: bool = True, 
                  max_order_usd: float = 10000, min_order_usd: float = 100,
                  margin_mode: str = 'ISOLATED', position_mode: str = 'ONE_WAY',
-                 auto_set_position_mode: bool = False, order_type: str = 'market',
-                 time_in_force: str = 'IOC', slippage_pct: float = 0.1,
+                 auto_set_position_mode: bool = False, auto_set_margin_mode: bool = False,
+                 order_type: str = 'market', time_in_force: str = 'IOC', slippage_pct: float = 0.1,
                  gtc_timeout_seconds: int = 300, trade_logging_enabled: bool = True):
         """
         Initialize Order Executor
@@ -704,6 +825,7 @@ class OrderExecutor:
             margin_mode: Margin mode ('ISOLATED' or 'CROSS')
             position_mode: Position mode ('ONE_WAY' or 'HEDGE_MODE')
             auto_set_position_mode: If True, automatically set position mode if mismatch
+            auto_set_margin_mode: If True, automatically set margin mode if mismatch
             order_type: Order type ('market' or 'limit')
             time_in_force: Time in force for limit orders ('IOC', 'GTC', 'FOK')
             slippage_pct: Slippage percentage for limit orders (positive = aggressive, negative = conservative)
@@ -717,6 +839,7 @@ class OrderExecutor:
         self.margin_mode = margin_mode
         self.position_mode = position_mode
         self.auto_set_position_mode = auto_set_position_mode
+        self.auto_set_margin_mode = auto_set_margin_mode
         self.order_type = order_type
         self.time_in_force = time_in_force
         self.slippage_pct = slippage_pct
@@ -724,6 +847,57 @@ class OrderExecutor:
         
         # Initialize trade logger
         self.trade_logger = TradeLogger(enabled=trade_logging_enabled)
+    
+    def verify_margin_mode(self, symbol: str) -> bool:
+        """
+        Verify that margin mode matches expected configuration
+        
+        Args:
+            symbol: Futures symbol to check
+            
+        Returns:
+            True if margin mode is correct, False otherwise
+        """
+        current_mode = self.client.get_margin_mode(symbol)
+        
+        if not current_mode:
+            logger.error("Failed to fetch margin mode")
+            return False
+        
+        if current_mode == self.margin_mode:
+            logger.info(f"[OK] Margin mode verified: {self.margin_mode}")
+            return True
+        
+        # Margin mode mismatch
+        logger.warning("=" * 80)
+        logger.warning("MARGIN MODE MISMATCH DETECTED")
+        logger.warning(f"  Current on KuCoin:  {current_mode}")
+        logger.warning(f"  Expected by bot:    {self.margin_mode}")
+        logger.warning("=" * 80)
+        
+        if self.auto_set_margin_mode:
+            logger.warning("NOTE: You must close ALL positions and cancel ALL orders before switching margin mode!")
+            logger.info(f"Attempting to set margin mode to {self.margin_mode}...")
+            success = self.client.set_margin_mode(symbol, self.margin_mode)
+            if success:
+                logger.info(f"[OK] Successfully set margin mode to {self.margin_mode}")
+                return True
+            else:
+                logger.error(f"✗ Failed to set margin mode to {self.margin_mode}")
+                logger.error("Please manually:")
+                logger.error("  1. Close all open positions")
+                logger.error("  2. Cancel all pending orders")
+                logger.error("  3. Set margin mode on KuCoin website")
+                return False
+        else:
+            logger.warning("Auto-set margin mode is DISABLED")
+            logger.warning(f"Please manually change margin mode to {self.margin_mode} on KuCoin:")
+            logger.warning("  1. Close all open positions")
+            logger.warning("  2. Cancel all pending orders")
+            logger.warning("  3. Go to Futures → Settings → Margin Mode")
+            logger.warning("  4. Select: " + self.margin_mode)
+            logger.warning("Or enable AUTO_SET_MARGIN_MODE=true in .env file")
+            return False
     
     def verify_position_mode(self, symbol: str) -> bool:
         """
@@ -865,6 +1039,12 @@ class OrderExecutor:
         logger.info(f"  Leverage:   {leverage}x")
         logger.info(f"  Order Type: {self.order_type}")
         
+        # Verify margin mode
+        if not self.verify_margin_mode(symbol):
+            error_msg = "Margin mode verification failed"
+            self.trade_logger.log_trade('OPEN_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+            return {'success': False, 'error': error_msg}
+        
         # Verify position mode
         if not self.verify_position_mode(symbol):
             error_msg = "Position mode verification failed"
@@ -969,6 +1149,12 @@ class OrderExecutor:
         logger.info(f"  Symbol:     {symbol}")
         logger.info(f"  Contracts:  {contracts:,}")
         logger.info(f"  Order Type: {self.order_type}")
+        
+        # Verify margin mode
+        if not self.verify_margin_mode(symbol):
+            error_msg = "Margin mode verification failed"
+            self.trade_logger.log_trade('CLOSE_SHORT', symbol, contracts, status='FAILED', error=error_msg)
+            return {'success': False, 'error': error_msg}
         
         # Verify position mode
         if not self.verify_position_mode(symbol):
@@ -1288,6 +1474,7 @@ class TradingBot:
         self.margin_mode = os.getenv('MARGIN_MODE', 'ISOLATED')
         self.position_mode = os.getenv('POSITION_MODE', 'ONE_WAY')
         self.auto_set_position_mode = os.getenv('AUTO_SET_POSITION_MODE', 'false').lower() == 'true'
+        self.auto_set_margin_mode = os.getenv('AUTO_SET_MARGIN_MODE', 'false').lower() == 'true'
         
         # Order execution
         self.order_type = os.getenv('ORDER_TYPE', 'market')
@@ -1339,6 +1526,7 @@ class TradingBot:
             margin_mode=self.margin_mode,
             position_mode=self.position_mode,
             auto_set_position_mode=self.auto_set_position_mode,
+            auto_set_margin_mode=self.auto_set_margin_mode,
             order_type=self.order_type,
             time_in_force=self.time_in_force,
             slippage_pct=self.slippage_pct,
